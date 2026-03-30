@@ -28,6 +28,11 @@ class MiniMindConfig(PretrainedConfig):
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
         self.rope_theta = kwargs.get("rope_theta", 1e6)
         self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
+        # Engram memory augmentation
+        self.use_engram = kwargs.get("use_engram", False)
+        self.engram_size = kwargs.get("engram_size", 64)
+        self.engram_scale = kwargs.get("engram_scale", 1.0)
+        self.engram_dropout = kwargs.get("engram_dropout", self.dropout)
         self.rope_scaling = {
             "beta_fast": 32,
             "beta_slow": 1,
@@ -173,6 +178,26 @@ class MOEFeedForward(nn.Module):
             self.aux_loss = scores.new_zeros(1).squeeze()
         return y.view(batch_size, seq_len, hidden_dim)
 
+class EngramMemory(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.mem_size = config.engram_size
+        self.hidden_size = config.hidden_size
+        self.scale = 1.0 / math.sqrt(self.hidden_size)
+        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.k_mem = nn.Parameter(torch.randn(self.mem_size, self.hidden_size) / math.sqrt(self.hidden_size))
+        self.v_mem = nn.Parameter(torch.randn(self.mem_size, self.hidden_size) / math.sqrt(self.hidden_size))
+        self.dropout = nn.Dropout(config.engram_dropout)
+        self.engram_scale = config.engram_scale
+
+    def forward(self, hidden_states):
+        # hidden_states: (batch, seq_len, hidden_size)
+        q = self.q_proj(hidden_states)  # (b, s, h)
+        scores = torch.matmul(q, self.k_mem.t()) * self.scale  # (b, s, mem)
+        attn = torch.softmax(scores, dim=-1)
+        mem_out = torch.matmul(attn, self.v_mem)  # (b, s, h)
+        return self.dropout(mem_out) * self.engram_scale
+
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
@@ -180,6 +205,7 @@ class MiniMindBlock(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        self.engram = EngramMemory(config) if getattr(config, "use_engram", False) else None
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         residual = hidden_states
@@ -188,6 +214,9 @@ class MiniMindBlock(nn.Module):
             past_key_value, use_cache, attention_mask
         )
         hidden_states += residual
+        if self.engram is not None:
+            normed = self.post_attention_layernorm(hidden_states)
+            hidden_states = hidden_states + self.engram(normed)
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
